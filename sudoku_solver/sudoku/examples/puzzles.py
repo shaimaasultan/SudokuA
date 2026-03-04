@@ -58,3 +58,6 @@ def example_puzzle_n25(density: float = 0.55):
 
 def example_puzzle_n36(density: float = 0.6):
     return _generate_dynamic_puzzle(size=36, box=6, density=density)
+
+def example_puzzle_n49(density: float = 0.65):
+    return _generate_dynamic_puzzle(size=49, box=7, density=density)

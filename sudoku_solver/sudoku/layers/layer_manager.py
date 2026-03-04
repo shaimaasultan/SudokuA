@@ -21,11 +21,6 @@ class LayerManager:
         self.col_masks = [0] * self.size
         self.box_masks = [0] * self.size
         
-        # Fill counts for O(1) degree calculation
-        self.row_fill_counts = [0] * self.size
-        self.col_fill_counts = [0] * self.size
-        self.box_fill_counts = [0] * self.size
-
         # Manual forbids per cell
         self.manual_masks = [[0] * self.size for _ in range(self.size)]
         
@@ -38,32 +33,83 @@ class LayerManager:
         clone.row_masks = self.row_masks[:]
         clone.col_masks = self.col_masks[:]
         clone.box_masks = self.box_masks[:]
-        clone.row_fill_counts = self.row_fill_counts[:]
-        clone.col_fill_counts = self.col_fill_counts[:]
-        clone.box_fill_counts = self.box_fill_counts[:]
         clone.manual_masks = [row[:] for row in self.manual_masks]
         return clone
 
     def get_cell_degree(self, r: int, c: int) -> int:
         """
-        O(1) degree: sum of empty cells in row, col, and box.
-        Since the intersection sizes are the same for all cells, 
-        this remains a perfect tie-breaker.
+        Count empty cells that would be affected by setting (r, c).
+        Used as a tie-breaker for MRV.
         """
-        b = self.grid.box_size * (r // self.grid.box_size) + (c // self.grid.box_size)
-        return (3 * self.size) - (self.row_fill_counts[r] + self.col_fill_counts[c] + self.box_fill_counts[b])
+        count = 0
+        N = self.size
+        # Row and Col
+        for i in range(N):
+            if i != c and self.grid.is_empty(r, i):
+                count += 1
+            if i != r and self.grid.is_empty(i, c):
+                count += 1
+        
+        # Box (only count cells not already in row or col)
+        box_size = self.grid.box_size
+        br = (r // box_size) * box_size
+        bc = (c // box_size) * box_size
+        for dr in range(box_size):
+            for dc in range(box_size):
+                rr, cc = br + dr, bc + dc
+                if rr != r and cc != c and self.grid.is_empty(rr, cc):
+                    count += 1
+        return count
 
     def rebuild_all_layers(self) -> None:
         self.row_masks = [0] * self.size
         self.col_masks = [0] * self.size
         self.box_masks = [0] * self.size
-        self.row_fill_counts = [0] * self.size
-        self.col_fill_counts = [0] * self.size
-        self.box_fill_counts = [0] * self.size
 
         for r, c in self.grid.iter_cells():
             v = self.grid.get(r, c)
             if v != 0:
+                self._update_masks(r, c, v, True)
+
+    def rebuild_affected_units(self, dirty_cells: set) -> None:
+        """
+        Incrementally rebuild only the affected units for dirty cells.
+        Much faster than rebuild_all_layers() when only a few cells changed.
+        dirty_cells: set of (r, c) tuples that affected the grid
+        """
+        if not dirty_cells:
+            return
+        
+        # Collect all affected units
+        affected_rows = set()
+        affected_cols = set()
+        affected_boxes = set()
+        box_size = self.grid.box_size
+        
+        for r, c in dirty_cells:
+            affected_rows.add(r)
+            affected_cols.add(c)
+            affected_boxes.add(box_size * (r // box_size) + (c // box_size))
+        
+        # Reset only affected mask rows
+        for r in affected_rows:
+            self.row_masks[r] = 0
+        # Reset only affected mask cols
+        for c in affected_cols:
+            self.col_masks[c] = 0
+        # Reset only affected mask boxes
+        for b in affected_boxes:
+            self.box_masks[b] = 0
+        
+        # Rebuild only affected units by scanning grid
+        for r, c in self.grid.iter_cells():
+            v = self.grid.get(r, c)
+            if v == 0:
+                continue
+            
+            # Check if this cell affects any of our affected units
+            box_idx = box_size * (r // box_size) + (c // box_size)
+            if r in affected_rows or c in affected_cols or box_idx in affected_boxes:
                 self._update_masks(r, c, v, True)
 
     def _update_masks(self, r: int, c: int, v: int, set_bits: bool) -> None:

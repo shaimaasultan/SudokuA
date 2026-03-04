@@ -24,8 +24,5 @@ class VisualHooks:
     def start_batch(self) -> None:
         pass
 
-    def mark_cell_heat(self, r: int, c: int, heat_score: float) -> None:
-        pass
-
     def end_batch(self) -> None:
         pass

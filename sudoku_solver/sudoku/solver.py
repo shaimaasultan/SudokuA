@@ -18,6 +18,7 @@ class SudokuSolver:
         self.size = size
         self.visual = visual or VisualHooks()
         self.last_solve_time = 0.0
+        self.stop_requested = False  # Flag to signal solver to stop
 
     def solve(self, values) -> Grid | None:
         start_time = time.perf_counter()
@@ -26,12 +27,17 @@ class SudokuSolver:
         layers = LayerManager(grid)
         propagator = Propagator(grid, layers, self.visual)
         self.branching_engine = BranchingEngine(grid, layers, propagator, self.visual)
+        self.branching_engine.solver = self  # Pass solver reference for stop checking
 
         # Initial propagation
         layers.rebuild_all_layers()
         try:
-            propagator.run_propagation()
+            propagator.run_propagation(self)
         except Contradiction:
+            self.last_solve_time = time.perf_counter() - start_time
+            return None
+
+        if self.stop_requested:
             self.last_solve_time = time.perf_counter() - start_time
             return None
 
@@ -39,6 +45,10 @@ class SudokuSolver:
         max_restarts = 5
         solution_found = False
         for attempt in range(max_restarts):
+            if self.stop_requested:
+                self.last_solve_time = time.perf_counter() - start_time
+                return None
+            
             try:
                 ok = self.branching_engine.solve_with_branching()
                 if ok:
@@ -48,15 +58,20 @@ class SudokuSolver:
                     self.last_solve_time = time.perf_counter() - start_time
                     return None
             except SearchRestart:
+                if self.stop_requested:
+                    self.last_solve_time = time.perf_counter() - start_time
+                    return None
+                
                 # Re-init engine components to restart fresh with new random seeds
                 print(f"Restarting search (attempt {attempt + 1})...")
                 grid = Grid(self.size, values)
                 layers = LayerManager(grid)
                 propagator = Propagator(grid, layers, self.visual)
                 self.branching_engine = BranchingEngine(grid, layers, propagator, self.visual)
+                self.branching_engine.solver = self
                 layers.rebuild_all_layers()
                 try:
-                    propagator.run_propagation()
+                    propagator.run_propagation(self)
                 except Contradiction:
                     self.last_solve_time = time.perf_counter() - start_time
                     return None

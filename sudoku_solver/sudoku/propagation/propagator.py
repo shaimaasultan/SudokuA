@@ -20,55 +20,81 @@ class ForcedMove:
 
 class Propagator:
     """
-    Handles logical propagation on layers:
-    - rebuild layers
-    - find forced moves
-    - apply them
-    - detect contradictions
+    Handles logical propagation on layers with incremental updates:
+    - Track dirty cells that changed
+    - Do incremental layer rebuilds
+    - Early contradiction detection
+    - Lazy constraint application
     """
 
     def __init__(self, grid: Grid, layers: LayerManager, visual: VisualHooks):
         self.grid = grid
         self.layers = layers
         self.visual = visual
+        self.dirty_cells = set()  # Track changed cells for incremental updates
 
     def rebuild_all_layers(self) -> None:
         self.layers.rebuild_all_layers()
 
-    def run_propagation(self) -> None:
+    def do_incremental_update(self) -> None:
+        """
+        Phase 1 Optimization: Incrementally rebuild affected units.
+        Only rebuilds the units affected by dirty cells, not entire grid.
+        """
+        if self.dirty_cells:
+            self.layers.rebuild_affected_units(self.dirty_cells)
+            self.dirty_cells.clear()
+
+    def run_propagation(self, solver=None) -> None:
         """
         Repeatedly apply forced moves and advanced pruning until no more exist 
         or a contradiction is found.
+        Phase 1: Uses incremental updates and early contradiction detection.
         """
         self.visual.start_batch()
+        self.dirty_cells.clear()  # Start fresh
+        # Initial rebuild for the starting state
+        self.layers.rebuild_all_layers()
         try:
             while True:
+                # Check for stop request
+                if solver and solver.stop_requested:
+                    return
+                
+                # Do incremental layer update if cells changed since last iteration
+                self.do_incremental_update()
+                
+                # Phase 1: Early contradiction detection - check immediately
+                self.check_for_contradictions()
+                
                 # 1. Independent "Signal" check (Full House)
                 # This is extremely fast now with bitmasks.
                 found_full_house = self.apply_full_house_signal()
                 if found_full_house:
-                    self.check_for_contradictions()
                     continue
                 
                 # 2. Standard forced moves (naked/hidden singles) - Optimized with bitmasks
                 forced = self.find_forced_moves()
                 if forced:
                     self.apply_forced_moves(forced)
-                    self.check_for_contradictions()
+                    # Update layers for newly assigned cells
+                    self.do_incremental_update()
+                    self.check_for_contradictions()  # Early detect
                     continue
                 
-                # 3. Advanced Pruning
+                # 3. Advanced Pruning (only if needed)
                 pruned = False
                 pruned |= self.apply_pointing_pairs()
-                pruned |= self.apply_naked_subsets()
+                pruned |= self.apply_naked_pairs()
                 pruned |= self.apply_hidden_pairs()
                 pruned |= self.apply_simple_coloring()
 
                 if pruned:
-                    self.check_for_contradictions()
+                    self.do_incremental_update()
+                    self.check_for_contradictions()  # Early detect
                     continue
                 
-                self.check_for_contradictions()
+                # No progress, we're done with propagation
                 return
         finally:
             self.visual.end_batch()
@@ -123,44 +149,41 @@ class Propagator:
 
         return any_pruned
 
-    def apply_naked_subsets(self) -> bool:
+    def apply_naked_pairs(self) -> bool:
         """
-        Generalized Naked Subsets (Pairs, Triples, Quadruples):
-        In a unit, if $k$ cells have a combined candidate set of size $k$,
-        those $k$ digits are locked in those $k$ cells.
-        Optimized via frequency analysis of masks.
+        Naked Pairs: Two cells in same unit have same TWO candidates.
+        Remove those candidates from other cells in unit.
         """
         any_pruned = False
         N = self.grid.size
+        # Row, Col, Box
         for unit_type in ['row', 'col', 'box']:
             for i in range(N):
-                masks = []
-                coords = []
+                # Identify candidates
+                masks = {} # mask -> list of (r, c)
                 for j in range(N):
                     r, c = self._get_unit_coords(unit_type, i, j)
-                    if self.grid.is_empty(r, c):
-                        masks.append(self.layers.get_allowed_mask(r, c))
-                        coords.append((r, c))
+                    if not self.grid.is_empty(r, c): continue
+                    mask = self.layers.get_allowed_mask(r, c)
+                    if bin(mask).count('1') == 2:
+                        if mask not in masks: masks[mask] = []
+                        masks[mask].append((r, c))
                 
-                if not masks: continue
-
-                # Frequency Map of masks
-                freq = {}
-                for m in masks: freq[m] = freq.get(m, 0) + 1
-
-                # Check for Naked Subsets
-                for mask, count in freq.items():
-                    if count > 1 and bin(mask).count('1') == count:
-                        subset_cells = [coords[idx] for idx, m in enumerate(masks) if m == mask]
-                        for idx, (r, c) in enumerate(coords):
-                            if (r, c) in subset_cells: continue
-                            if masks[idx] & mask:
+                # Apply pruning
+                for mask, cells in masks.items():
+                    if len(cells) == 2:
+                        for j in range(N):
+                            rr, cc = self._get_unit_coords(unit_type, i, j)
+                            if (rr, cc) in cells: continue
+                            if not self.grid.is_empty(rr, cc): continue
+                            if self.layers.get_allowed_mask(rr, cc) & mask:
+                                # Forbid digits in mask
                                 m = mask
                                 while m:
                                     bit = m & -m
                                     d = bit.bit_length()
-                                    if self.layers.is_digit_possible_at(d, r, c):
-                                        self.layers.forbid_choice(d, r, c)
+                                    if self.layers.is_digit_possible_at(d, rr, cc):
+                                        self.layers.forbid_choice(d, rr, cc)
                                         any_pruned = True
                                     m &= ~bit
         return any_pruned
@@ -289,7 +312,6 @@ class Propagator:
                             any_pruned = True
         return any_pruned
 
-
     def _share_unit(self, p1: tuple[int, int], p2: tuple[int, int]) -> bool:
         r1, c1 = p1; r2, c2 = p2
         if r1 == r2 or c1 == c2: return True
@@ -358,10 +380,10 @@ class Propagator:
             if self.grid.is_empty(r, c):
                 self.grid.set(r, c, d)
                 self.visual.mark_forced(r, c, d)
+                self.dirty_cells.add((r, c))
                 applied = True
         
-        if applied:
-            self.layers.rebuild_all_layers()
+        # Don't rebuild here - let do_incremental_update handle it with Phase 1 optimization
         return applied
 
     def find_forced_moves(self) -> List[ForcedMove]:
@@ -383,66 +405,90 @@ class Propagator:
         if forced: return self._deduplicate(forced)
 
         # 2. Hidden Singles (Digit is allowed in only one cell in a unit)
-        # Optimized with Prefix/Suffix OR logic for O(N) per unit.
         
         # Rows
         for r in range(N):
-            masks = [self.layers.get_allowed_mask(r, c) for c in range(N)]
-            # prefix_or[i] is OR of masks[0...i-1]
-            pre = [0] * (N + 1)
-            for c in range(N): pre[c+1] = pre[c] | masks[c]
-            # suf[i] is OR of masks[i...N-1]
-            suf = [0] * (N + 1)
-            for c in range(N-1, -1, -1): suf[c] = suf[c+1] | masks[c]
-            
-            row_occ = self.layers.row_masks[r]
+            once = 0
+            multiple = 0
+            cell_for_digit = {} # digit -> col
             for c in range(N):
                 if not self.grid.is_empty(r, c): continue
-                # Digit d is a hidden single if it's possible here AND not possible anywhere else in unit
-                hidden = masks[c] & ~(pre[c] | suf[c+1] | row_occ)
-                if hidden:
-                    while hidden:
-                        bit = hidden & -hidden
-                        forced.append(ForcedMove(r, c, bit.bit_length()))
-                        hidden &= ~bit
-
-        # Cols
-        for c in range(N):
-            masks = [self.layers.get_allowed_mask(r, c) for r in range(N)]
-            pre = [0] * (N + 1)
-            for r in range(N): pre[r+1] = pre[r] | masks[r]
-            suf = [0] * (N + 1)
-            for r in range(N-1, -1, -1): suf[r] = suf[r+1] | masks[r]
+                mask = self.layers.get_allowed_mask(r, c)
+                curr = mask
+                while curr:
+                    bit = curr & -curr
+                    d = bit.bit_length()
+                    if bit & once:
+                        multiple |= bit
+                    else:
+                        once |= bit
+                        cell_for_digit[d] = c
+                    curr &= ~bit
             
-            col_occ = self.layers.col_masks[c]
+            singles = once & ~multiple
+            while singles:
+                bit = singles & -singles
+                d = bit.bit_length()
+                forced.append(ForcedMove(r, cell_for_digit[d], d))
+                singles &= ~bit
+
+        # Cols (Similar logic)
+        for c in range(N):
+            once = 0
+            multiple = 0
+            cell_for_digit = {} # digit -> row
             for r in range(N):
                 if not self.grid.is_empty(r, c): continue
-                hidden = masks[r] & ~(pre[r] | suf[r+1] | col_occ)
-                if hidden:
-                    while hidden:
-                        bit = hidden & -hidden
-                        forced.append(ForcedMove(r, c, bit.bit_length()))
-                        hidden &= ~bit
+                mask = self.layers.get_allowed_mask(r, c)
+                curr = mask
+                while curr:
+                    bit = curr & -curr
+                    d = bit.bit_length()
+                    if bit & once:
+                        multiple |= bit
+                    else:
+                        once |= bit
+                        cell_for_digit[d] = r
+                    curr &= ~bit
+            
+            singles = once & ~multiple
+            while singles:
+                bit = singles & -singles
+                d = bit.bit_length()
+                forced.append(ForcedMove(cell_for_digit[d], c, d))
+                singles &= ~bit
 
         # Boxes
+        box_size = self.grid.box_size
         for b in range(N):
-            coords = [self._get_unit_coords('box', b, i) for i in range(N)]
-            masks = [self.layers.get_allowed_mask(r, c) for r, c in coords]
-            pre = [0] * (N + 1)
-            for i in range(N): pre[i+1] = pre[i] | masks[i]
-            suf = [0] * (N + 1)
-            for i in range(N-1, -1, -1): suf[i] = suf[i+1] | masks[i]
+            br = (b // box_size) * box_size
+            bc = (b % box_size) * box_size
+            once = 0
+            multiple = 0
+            cell_for_digit = {} # digit -> (r, c)
+            for dr in range(box_size):
+                for dc in range(box_size):
+                    r, c = br + dr, bc + dc
+                    if not self.grid.is_empty(r, c): continue
+                    mask = self.layers.get_allowed_mask(r, c)
+                    curr = mask
+                    while curr:
+                        bit = curr & -curr
+                        d = bit.bit_length()
+                        if bit & once:
+                            multiple |= bit
+                        else:
+                            once |= bit
+                            cell_for_digit[d] = (r, c)
+                        curr &= ~bit
             
-            box_occ = self.layers.box_masks[b]
-            for i in range(N):
-                r, c = coords[i]
-                if not self.grid.is_empty(r, c): continue
-                hidden = masks[i] & ~(pre[i] | suf[i+1] | box_occ)
-                if hidden:
-                    while hidden:
-                        bit = hidden & -hidden
-                        forced.append(ForcedMove(r, c, bit.bit_length()))
-                        hidden &= ~bit
+            singles = once & ~multiple
+            while singles:
+                bit = singles & -singles
+                d = bit.bit_length()
+                rr, cc = cell_for_digit[d]
+                forced.append(ForcedMove(rr, cc, d))
+                singles &= ~bit
 
         return self._deduplicate(forced)
 
@@ -458,7 +504,8 @@ class Propagator:
             if self.grid.is_empty(mv.row, mv.col):
                 self.grid.set(mv.row, mv.col, mv.digit)
                 self.visual.mark_forced(mv.row, mv.col, mv.digit)
-        self.layers.rebuild_all_layers()
+                self.dirty_cells.add((mv.row, mv.col))
+        # Don't rebuild here - let do_incremental_update handle it with Phase 1 optimization
 
     def check_for_contradictions(self) -> None:
         """

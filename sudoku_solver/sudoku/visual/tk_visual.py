@@ -160,11 +160,6 @@ class TkVisual(VisualHooks):
         self.root.after(120, lambda: self._safe_canvas_call(self.canvas.itemconfig, rect, fill=old))
         self._refresh()
 
-    def mark_cell_heat(self, r: int, c: int, heat_score: float) -> None:
-        """Color cell background based on conflict heat (Reverted)."""
-        pass
-
-
     def start_batch(self) -> None:
         self.batch_mode = True
 

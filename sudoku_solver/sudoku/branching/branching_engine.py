@@ -35,6 +35,7 @@ class BranchingEngine:
         self.nodes_visited = 0
         self.restart_threshold = grid.size ** 2  # Balanced threshold
         self.try_counts: dict[tuple[int, int, int], int] = {}
+        self.solver = None  # Will be set by SudokuSolver
     # ------------------------------------------------------------------ #
     # Top-level search
     # ------------------------------------------------------------------ #
@@ -46,6 +47,10 @@ class BranchingEngine:
         Otherwise chooses the cell with the fewest candidates (MRV).
         Uses Max Degree as a tie-breaker.
         """
+        # Check for stop request
+        if self.solver and self.solver.stop_requested:
+            return False
+        
         if self.is_solved():
             return True
 
@@ -81,18 +86,26 @@ class BranchingEngine:
         # 1. Determine target cells based on priority (Degree-2 first, else MRV)
         targets = degree_2_cells if degree_2_cells else mrv_cells
         
-        # 2. Tie-break using Max Degree (most empty neighbors)
+        # 2. Tie-break using Conflict Heat + Max Degree
         best_cell = None
-        max_degree = -1
+        max_priority = -1
         
         for r, c, mask in targets:
+            # Heat: sum of previous failures for allowed digits in this cell
+            # This "colors" the cell as a high-conflict area.
+            heat = sum(self.try_counts.get((r, c, d), 0) for d in self._mask_to_list(mask))
             deg = self.layers.get_cell_degree(r, c)
-            if deg > max_degree:
-                max_degree = deg
+            
+            # Combine Heat and Degree into a single priority score
+            # Heat is most important (resolve bottlenecks), then Degree (pruning power)
+            priority = (heat * 200) + deg
+            
+            if priority > max_priority:
+                max_priority = priority
                 best_cell = (r, c, mask)
-            elif deg == max_degree:
+            elif priority == max_priority:
                 # Still tied? Small random jitter
-                if random.random() < 0.3:
+                if random.random() < 0.2:
                     best_cell = (r, c, mask)
 
         if not best_cell:
@@ -113,6 +126,10 @@ class BranchingEngine:
     def try_all_options(self, r: int, c: int, digits: list[int]) -> bool:
         """Sequential backtracking: try all given digits for cell (r, c)."""
         for d in digits:
+            # Check for stop request
+            if self.solver and self.solver.stop_requested:
+                return False
+            
             # 1. Stagnation Detection: Track how many times (r, c, d) is tried
             key = (r, c, d)
             self.try_counts[key] = self.try_counts.get(key, 0) + 1
@@ -142,7 +159,7 @@ class BranchingEngine:
 
             success = False
             try:
-                self.propagator.run_propagation()
+                self.propagator.run_propagation(self.solver)
                 if self.is_solved():
                     success = True
                 else:
@@ -154,14 +171,13 @@ class BranchingEngine:
                 return True
 
             # Backtrack
-
             prev = self.state_stack.pop()
             self.grid = prev["grid"]
             self.layers = prev["layers"]
             self.propagator.grid = self.grid
             self.propagator.layers = self.layers
             
-            # Record this specific choice failure
+            # Record this failure (optional, but helps consistency)
             self.layers.forbid_choice(d, r, c)
         
         return False
