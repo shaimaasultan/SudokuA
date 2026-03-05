@@ -62,6 +62,9 @@ class SudokuSolver:
                     self.last_solve_time = time.perf_counter() - start_time
                     return None
                 
+                # Decay counts
+                self.branching_engine.decay_counts()
+                
                 # Re-init engine components to restart fresh with new random seeds
                 print(f"Restarting search (attempt {attempt + 1})...")
                 grid = Grid(self.size, values)

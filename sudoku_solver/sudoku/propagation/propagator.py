@@ -1,7 +1,9 @@
 # sudoku/propagation/propagator.py
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List
+from itertools import combinations
+import numpy as np
 from ..model.grid import Grid
 from ..layers.layer_manager import LayerManager
 from ..visual.visual_hooks import VisualHooks
@@ -20,81 +22,57 @@ class ForcedMove:
 
 class Propagator:
     """
-    Handles logical propagation on layers with incremental updates:
-    - Track dirty cells that changed
-    - Do incremental layer rebuilds
-    - Early contradiction detection
-    - Lazy constraint application
+    Handles logical propagation on layers:
+    - rebuild layers
+    - find forced moves
+    - apply them
+    - detect contradictions
     """
 
     def __init__(self, grid: Grid, layers: LayerManager, visual: VisualHooks):
         self.grid = grid
         self.layers = layers
         self.visual = visual
-        self.dirty_cells = set()  # Track changed cells for incremental updates
 
     def rebuild_all_layers(self) -> None:
         self.layers.rebuild_all_layers()
-
-    def do_incremental_update(self) -> None:
-        """
-        Phase 1 Optimization: Incrementally rebuild affected units.
-        Only rebuilds the units affected by dirty cells, not entire grid.
-        """
-        if self.dirty_cells:
-            self.layers.rebuild_affected_units(self.dirty_cells)
-            self.dirty_cells.clear()
 
     def run_propagation(self, solver=None) -> None:
         """
         Repeatedly apply forced moves and advanced pruning until no more exist 
         or a contradiction is found.
-        Phase 1: Uses incremental updates and early contradiction detection.
         """
         self.visual.start_batch()
-        self.dirty_cells.clear()  # Start fresh
-        # Initial rebuild for the starting state
-        self.layers.rebuild_all_layers()
         try:
             while True:
                 # Check for stop request
                 if solver and solver.stop_requested:
                     return
                 
-                # Do incremental layer update if cells changed since last iteration
-                self.do_incremental_update()
-                
-                # Phase 1: Early contradiction detection - check immediately
-                self.check_for_contradictions()
-                
                 # 1. Independent "Signal" check (Full House)
                 # This is extremely fast now with bitmasks.
                 found_full_house = self.apply_full_house_signal()
                 if found_full_house:
+                    self.check_for_contradictions()
                     continue
                 
                 # 2. Standard forced moves (naked/hidden singles) - Optimized with bitmasks
                 forced = self.find_forced_moves()
                 if forced:
                     self.apply_forced_moves(forced)
-                    # Update layers for newly assigned cells
-                    self.do_incremental_update()
-                    self.check_for_contradictions()  # Early detect
+                    self.check_for_contradictions()
                     continue
                 
-                # 3. Advanced Pruning (only if needed)
-                pruned = False
-                pruned |= self.apply_pointing_pairs()
-                pruned |= self.apply_naked_pairs()
-                pruned |= self.apply_hidden_pairs()
-                pruned |= self.apply_simple_coloring()
-
-                if pruned:
-                    self.do_incremental_update()
-                    self.check_for_contradictions()  # Early detect
+                # 3. Advanced Pruning (short-circuit: restart loop on first success)
+                if (self.apply_pointing_pairs()
+                    or self.apply_naked_pairs()
+                    or self.apply_naked_triples()
+                    or self.apply_hidden_pairs()
+                    or self.apply_simple_coloring()):
+                    self.check_for_contradictions()
                     continue
                 
-                # No progress, we're done with propagation
+                self.check_for_contradictions()
                 return
         finally:
             self.visual.end_batch()
@@ -108,46 +86,74 @@ class Propagator:
         """
         N = self.grid.size
         box_size = self.grid.box_size
-        digits = self.layers.digits
+        bs_cols = N // box_size
         any_pruned = False
 
-        for d in digits:
-            for br in range(0, N, box_size):
-                for bc in range(0, N, box_size):
-                    # Find all candidates for digit d in this box
-                    candidates = []
-                    for dr in range(box_size):
-                        for dc in range(box_size):
-                            rr, cc = br + dr, bc + dc
-                            if self.layers.is_digit_possible_at(d, rr, cc):
-                                candidates.append((rr, cc))
-                    
-                    if not candidates:
-                        continue
-                    
-                    # Check Row alignment
-                    rows = {r for (r, c) in candidates}
-                    if len(rows) == 1:
-                        target_r = list(rows)[0]
-                        for col in range(N):
-                            if col >= bc and col < bc + box_size:
-                                continue
-                            if self.layers.is_digit_possible_at(d, target_r, col):
-                                self.layers.forbid_choice(d, target_r, col)
-                                any_pruned = True
+        # Single N×N pass: build per-digit, per-box candidate lists
+        # box_d_cells[box_id][digit] = list of (r, c)
+        box_d_cells = [[[] for _ in range(N + 1)] for _ in range(N)]
 
-                    # Check Col alignment
-                    cols = {c for (r, c) in candidates}
-                    if len(cols) == 1:
-                        target_c = list(cols)[0]
-                        for row in range(N):
-                            if row >= br and row < br + box_size:
-                                continue
-                            if self.layers.is_digit_possible_at(d, row, target_c):
-                                self.layers.forbid_choice(d, row, target_c)
-                                any_pruned = True
+        all_masks = self.layers.get_all_allowed_masks().tolist()
+        for r in range(N):
+            for c in range(N):
+                mask = all_masks[r][c]
+                if not mask: continue
+                b = (r // box_size) * bs_cols + (c // box_size)
+                curr = mask
+                while curr:
+                    bit = curr & -curr
+                    box_d_cells[b][bit.bit_length()].append((r, c))
+                    curr &= ~bit
+
+        for bi in range(N):
+            br = (bi // bs_cols) * box_size
+            bc = (bi % bs_cols) * box_size
+            for d in range(1, N + 1):
+                candidates = box_d_cells[bi][d]
+                if not candidates:
+                    continue
+
+                # Check Row alignment
+                first_r = candidates[0][0]
+                if all(r == first_r for r, c in candidates):
+                    for col in range(N):
+                        if bc <= col < bc + box_size:
+                            continue
+                        if self.layers.is_digit_possible_at(d, first_r, col):
+                            self.layers.forbid_choice(d, first_r, col)
+                            any_pruned = True
+
+                # Check Col alignment
+                first_c = candidates[0][1]
+                if all(c == first_c for r, c in candidates):
+                    for row in range(N):
+                        if br <= row < br + box_size:
+                            continue
+                        if self.layers.is_digit_possible_at(d, row, first_c):
+                            self.layers.forbid_choice(d, row, first_c)
+                            any_pruned = True
 
         return any_pruned
+
+    def _collect_unit_cells(self):
+        """Shared N×N scan for naked pairs and naked triples."""
+        N = self.grid.size
+        box_size = self.grid.box_size
+        bs_cols = N // box_size
+        row_cells = [[] for _ in range(N)]
+        col_cells = [[] for _ in range(N)]
+        box_cells = [[] for _ in range(N)]
+        all_masks = self.layers.get_all_allowed_masks().tolist()
+        for r in range(N):
+            for c in range(N):
+                mask = all_masks[r][c]
+                if not mask: continue
+                b = (r // box_size) * bs_cols + (c // box_size)
+                entry = (mask, r, c)
+                row_cells[r].append(entry)
+                col_cells[c].append(entry)
+                box_cells[b].append(entry)
+        return row_cells, col_cells, box_cells
 
     def apply_naked_pairs(self) -> bool:
         """
@@ -156,29 +162,57 @@ class Propagator:
         """
         any_pruned = False
         N = self.grid.size
-        # Row, Col, Box
-        for unit_type in ['row', 'col', 'box']:
-            for i in range(N):
-                # Identify candidates
-                masks = {} # mask -> list of (r, c)
-                for j in range(N):
-                    r, c = self._get_unit_coords(unit_type, i, j)
-                    if not self.grid.is_empty(r, c): continue
-                    mask = self.layers.get_allowed_mask(r, c)
-                    if bin(mask).count('1') == 2:
+        row_cells, col_cells, box_cells = self._collect_unit_cells()
+
+        for i in range(N):
+            for unit_cells in (row_cells[i], col_cells[i], box_cells[i]):
+                # Find naked pairs
+                masks = {}
+                for mask, r, c in unit_cells:
+                    if mask.bit_count() == 2:
                         if mask not in masks: masks[mask] = []
                         masks[mask].append((r, c))
-                
-                # Apply pruning
-                for mask, cells in masks.items():
-                    if len(cells) == 2:
-                        for j in range(N):
-                            rr, cc = self._get_unit_coords(unit_type, i, j)
-                            if (rr, cc) in cells: continue
-                            if not self.grid.is_empty(rr, cc): continue
-                            if self.layers.get_allowed_mask(rr, cc) & mask:
-                                # Forbid digits in mask
+
+                for mask, pair_cells in masks.items():
+                    if len(pair_cells) == 2:
+                        pair_set = set(pair_cells)
+                        for m2, rr, cc in unit_cells:
+                            if (rr, cc) in pair_set: continue
+                            if m2 & mask:
                                 m = mask
+                                while m:
+                                    bit = m & -m
+                                    d = bit.bit_length()
+                                    if self.layers.is_digit_possible_at(d, rr, cc):
+                                        self.layers.forbid_choice(d, rr, cc)
+                                        any_pruned = True
+                                    m &= ~bit
+        return any_pruned
+
+    def apply_naked_triples(self) -> bool:
+        """
+        Naked Triples: Three cells in same unit have exactly THREE candidates among them.
+        Remove those candidates from other cells in unit.
+        """
+        any_pruned = False
+        N = self.grid.size
+        row_cells, col_cells, box_cells = self._collect_unit_cells()
+
+        for i in range(N):
+            for unit_cells in (row_cells[i], col_cells[i], box_cells[i]):
+                # Identify cells with 2 or 3 candidates
+                triples = [(mask, (r, c)) for mask, r, c in unit_cells
+                           if 2 <= mask.bit_count() <= 3]
+
+                for combo in combinations(triples, 3):
+                    m0, m1, m2 = combo[0][0], combo[1][0], combo[2][0]
+                    union_mask = m0 | m1 | m2
+                    if union_mask.bit_count() == 3:
+                        triple_cells = {combo[0][1], combo[1][1], combo[2][1]}
+                        for mask, rr, cc in unit_cells:
+                            if (rr, cc) in triple_cells: continue
+                            if mask & union_mask:
+                                m = union_mask
                                 while m:
                                     bit = m & -m
                                     d = bit.bit_length()
@@ -195,48 +229,52 @@ class Propagator:
         """
         any_pruned = False
         N = self.grid.size
-        for unit_type in ['row', 'col', 'box']:
-            for i in range(N):
-                # Map digit -> list of cells
-                digit_to_cells = {d: [] for d in range(1, N + 1)}
-                for j in range(N):
-                    r, c = self._get_unit_coords(unit_type, i, j)
-                    if not self.grid.is_empty(r, c): continue
-                    mask = self.layers.get_allowed_mask(r, c)
-                    curr = mask
-                    while curr:
-                        bit = curr & -curr
-                        d = bit.bit_length()
-                        digit_to_cells[d].append((r, c))
-                        curr &= ~bit
-                
-                # Find digits that appear in exactly 2 cells
-                pairs = {d: tuple(sorted(cells)) for d, cells in digit_to_cells.items() if len(cells) == 2}
-                
-                # See if two digits share the same 2 cells
-                rev = {} # cells -> list of digits
+        box_size = self.grid.box_size
+        bs_cols = N // box_size
+
+        # Single N×N pass: build digit->cells for all rows, cols, boxes
+        row_d2c = [[[] for _ in range(N + 1)] for _ in range(N)]  # row_d2c[row][digit] = cells
+        col_d2c = [[[] for _ in range(N + 1)] for _ in range(N)]
+        box_d2c = [[[] for _ in range(N + 1)] for _ in range(N)]
+
+        all_masks = self.layers.get_all_allowed_masks().tolist()
+        for r in range(N):
+            for c in range(N):
+                mask = all_masks[r][c]
+                if not mask: continue
+                b = (r // box_size) * bs_cols + (c // box_size)
+                curr = mask
+                while curr:
+                    bit = curr & -curr
+                    d = bit.bit_length()
+                    cell = (r, c)
+                    row_d2c[r][d].append(cell)
+                    col_d2c[c][d].append(cell)
+                    box_d2c[b][d].append(cell)
+                    curr &= ~bit
+
+        # Process all units in one loop
+        for i in range(N):
+            for d2c in (row_d2c[i], col_d2c[i], box_d2c[i]):
+                pairs = {d: tuple(sorted(cells)) for d in range(1, N + 1)
+                         if len((cells := d2c[d])) == 2}
+
+                rev = {}
                 for d, cells in pairs.items():
                     if cells not in rev: rev[cells] = []
                     rev[cells].append(d)
-                
+
                 for cells, digits in rev.items():
                     if len(digits) == 2:
-                        # HIDDEN PAIR! Digits in 'digits' are locked in 'cells'.
-                        # Remove all other digits from 'cells'.
-                        mask_to_keep = 0
-                        for d in digits: mask_to_keep |= (1 << (d - 1))
-                        
+                        mask_to_keep = (1 << (digits[0] - 1)) | (1 << (digits[1] - 1))
                         for rr, cc in cells:
-                            curr_mask = self.layers.get_allowed_mask(rr, cc)
-                            to_remove = curr_mask & ~mask_to_keep
+                            to_remove = self.layers.get_allowed_mask(rr, cc) & ~mask_to_keep
                             if to_remove:
+                                any_pruned = True
                                 m = to_remove
                                 while m:
                                     bit = m & -m
-                                    dd = bit.bit_length()
-                                    if self.layers.is_digit_possible_at(dd, rr, cc):
-                                        self.layers.forbid_choice(dd, rr, cc)
-                                        any_pruned = True
+                                    self.layers.forbid_choice(bit.bit_length(), rr, cc)
                                     m &= ~bit
         return any_pruned
 
@@ -249,15 +287,41 @@ class Propagator:
         """
         any_pruned = False
         N = self.grid.size
+        bs = self.grid.box_size
+        bs_cols = N // bs
+
+        # Single N×N pass to build per-digit row/col/box lists for all digits
+        all_row = [[[] for _ in range(N)] for _ in range(N + 1)]
+        all_col = [[[] for _ in range(N)] for _ in range(N + 1)]
+        all_box = [[[] for _ in range(N)] for _ in range(N + 1)]
+        all_possible = [[] for _ in range(N + 1)]
+
+        all_masks = self.layers.get_all_allowed_masks().tolist()
+        for r in range(N):
+            for c in range(N):
+                mask = all_masks[r][c]
+                if not mask: continue
+                b = (r // bs) * bs_cols + (c // bs)
+                curr = mask
+                while curr:
+                    bit = curr & -curr
+                    d = bit.bit_length()
+                    cell = (r, c)
+                    all_row[d][r].append(cell)
+                    all_col[d][c].append(cell)
+                    all_box[d][b].append(cell)
+                    all_possible[d].append(cell)
+                    curr &= ~bit
+
         for d in range(1, N + 1):
-            adj = {} # cell -> list of cells
-            for unit_type in ['row', 'col', 'box']:
-                for i in range(N):
-                    candidates = []
-                    for j in range(N):
-                        r, c = self._get_unit_coords(unit_type, i, j)
-                        if self.layers.is_digit_possible_at(d, r, c):
-                            candidates.append((r, c))
+            row_cells = all_row[d]
+            col_cells = all_col[d]
+            box_cells = all_box[d]
+            possible_cells = all_possible[d]
+
+            adj = {}
+            for unit_list in (row_cells, col_cells, box_cells):
+                for candidates in unit_list:
                     if len(candidates) == 2:
                         u, v = candidates
                         adj.setdefault(u, []).append(v)
@@ -283,15 +347,20 @@ class Propagator:
                 color_groups = [[], []]
                 for cell, color in component: color_groups[color].append(cell)
                 
-                # Rule 1: Twice in a Unit
+                # Build unit sets for both colors in one pass (serves Rule 1 + Rule 2)
+                seen_rows = [set(), set()]
+                seen_cols = [set(), set()]
+                seen_boxes = [set(), set()]
                 invalid_color = -1
-                for color in [0, 1]:
-                    group = color_groups[color]
-                    for i in range(len(group)):
-                        for j in range(i + 1, len(group)):
-                            if self._share_unit(group[i], group[j]):
-                                invalid_color = color; break
-                        if invalid_color != -1: break
+                for color in (0, 1):
+                    for cr, cc in color_groups[color]:
+                        box_id = (cr // bs) * bs_cols + (cc // bs)
+                        if invalid_color == -1:
+                            if cr in seen_rows[color] or cc in seen_cols[color] or box_id in seen_boxes[color]:
+                                invalid_color = color
+                        seen_rows[color].add(cr)
+                        seen_cols[color].add(cc)
+                        seen_boxes[color].add(box_id)
                 
                 if invalid_color != -1:
                     for r, c in color_groups[invalid_color]:
@@ -299,33 +368,19 @@ class Propagator:
                         any_pruned = True
                     continue
 
-                # Rule 2: Two Colors
+                # Rule 2: Two Colors (sets already built above)
                 in_component = {cell for cell, _ in component}
-                for r in range(N):
-                    for c in range(N):
-                        if (r, c) in in_component or not self.layers.is_digit_possible_at(d, r, c):
-                            continue
-                        sees0 = any(self._share_unit((r, c), c0) for c0 in color_groups[0])
-                        sees1 = any(self._share_unit((r, c), c1) for c1 in color_groups[1])
-                        if sees0 and sees1:
-                            self.layers.forbid_choice(d, r, c)
-                            any_pruned = True
+                for r, c in possible_cells:
+                    if (r, c) in in_component:
+                        continue
+                    box_id = (r // bs) * bs_cols + (c // bs)
+                    sees0 = r in seen_rows[0] or c in seen_cols[0] or box_id in seen_boxes[0]
+                    sees1 = r in seen_rows[1] or c in seen_cols[1] or box_id in seen_boxes[1]
+                    if sees0 and sees1:
+                        self.layers.forbid_choice(d, r, c)
+                        any_pruned = True
         return any_pruned
 
-    def _share_unit(self, p1: tuple[int, int], p2: tuple[int, int]) -> bool:
-        r1, c1 = p1; r2, c2 = p2
-        if r1 == r2 or c1 == c2: return True
-        bs = self.grid.box_size
-        return (r1 // bs == r2 // bs) and (c1 // bs == c2 // bs)
-
-    def _get_unit_coords(self, unit_type: str, idx: int, pos: int) -> tuple[int, int]:
-        N = self.grid.size
-        if unit_type == 'row': return idx, pos
-        if unit_type == 'col': return pos, idx
-        box_size = self.grid.box_size
-        br = (idx // box_size) * box_size
-        bc = (idx % box_size) * box_size
-        return br + (pos // box_size), bc + (pos % box_size)
 
     def apply_full_house_signal(self) -> bool:
         """
@@ -334,43 +389,36 @@ class Propagator:
         """
         N = self.grid.size
         full_mask = (1 << N) - 1
+        box_size = self.grid.box_size
+        bs_cols = N // box_size
         moves = []
 
-        # Rows
-        for r in range(N):
-            occupied = self.layers.row_masks[r]
-            unoccupied = full_mask & ~occupied
-            # check if exactly one bit is set (popcount == 1)
-            if unoccupied and (unoccupied & (unoccupied - 1)) == 0:
-                # Find which col is empty
-                empty_cols = [c for c in range(N) if self.grid.is_empty(r, c)]
-                if len(empty_cols) == 1:
-                    d = unoccupied.bit_length()
-                    moves.append((r, empty_cols[0], d))
+        # Vectorized empty counting
+        empty = (self.grid.values == 0)
+        row_cnt = empty.sum(axis=1)
+        col_cnt = empty.sum(axis=0)
+        box_cnt = empty.reshape(box_size, box_size, box_size, box_size).sum(axis=(1, 3)).ravel()
 
-        # Cols
-        for c in range(N):
-            occupied = self.layers.col_masks[c]
-            unoccupied = full_mask & ~occupied
-            if unoccupied and (unoccupied & (unoccupied - 1)) == 0:
-                empty_rows = [r for r in range(N) if self.grid.is_empty(r, c)]
-                if len(empty_rows) == 1:
-                    d = unoccupied.bit_length()
-                    moves.append((empty_rows[0], c, d))
+        for i in range(N):
+            if row_cnt[i] == 1:
+                row_unocc = int(full_mask & ~self.layers.row_masks[i])
+                if row_unocc and (row_unocc & (row_unocc - 1)) == 0:
+                    c = int(np.argmax(empty[i, :]))
+                    moves.append((i, c, row_unocc.bit_length()))
 
-        # Boxes
-        box_size = self.grid.box_size
-        for b in range(N):
-            occupied = self.layers.box_masks[b]
-            unoccupied = full_mask & ~occupied
-            if unoccupied and (unoccupied & (unoccupied - 1)) == 0:
-                br = (b // box_size) * box_size
-                bc = (b % box_size) * box_size
-                empty_cells = [(br + dr, bc + dc) for dr in range(box_size) for dc in range(box_size) 
-                                if self.grid.is_empty(br + dr, bc + dc)]
-                if len(empty_cells) == 1:
-                    d = unoccupied.bit_length()
-                    moves.append((empty_cells[0][0], empty_cells[0][1], d))
+            if col_cnt[i] == 1:
+                col_unocc = int(full_mask & ~self.layers.col_masks[i])
+                if col_unocc and (col_unocc & (col_unocc - 1)) == 0:
+                    r = int(np.argmax(empty[:, i]))
+                    moves.append((r, i, col_unocc.bit_length()))
+
+            if box_cnt[i] == 1:
+                box_unocc = int(full_mask & ~self.layers.box_masks[i])
+                if box_unocc and (box_unocc & (box_unocc - 1)) == 0:
+                    br = (i // bs_cols) * box_size
+                    bc = (i % bs_cols) * box_size
+                    idx = np.argwhere(empty[br:br+box_size, bc:bc+box_size])[0]
+                    moves.append((br + int(idx[0]), bc + int(idx[1]), box_unocc.bit_length()))
 
         if not moves:
             return False
@@ -379,11 +427,9 @@ class Propagator:
         for r, c, d in moves:
             if self.grid.is_empty(r, c):
                 self.grid.set(r, c, d)
+                self.layers._update_masks(r, c, d, True)
                 self.visual.mark_forced(r, c, d)
-                self.dirty_cells.add((r, c))
                 applied = True
-        
-        # Don't rebuild here - let do_incremental_update handle it with Phase 1 optimization
         return applied
 
     def find_forced_moves(self) -> List[ForcedMove]:
@@ -391,102 +437,77 @@ class Propagator:
         Find forced moves in parallel using bitmask logic.
         O(N^2) complexity.
         """
-        forced: List[ForcedMove] = []
+        naked: List[ForcedMove] = []
         N = self.grid.size
-        
-        # 1. Naked Singles (Cell has only 1 allowed digit)
-        for r, c in self.grid.iter_cells():
-            if not self.grid.is_empty(r, c):
-                continue
-            mask = self.layers.get_allowed_mask(r, c)
-            if mask and (mask & (mask - 1)) == 0:
-                forced.append(ForcedMove(r, c, mask.bit_length()))
-        
-        if forced: return self._deduplicate(forced)
-
-        # 2. Hidden Singles (Digit is allowed in only one cell in a unit)
-        
-        # Rows
-        for r in range(N):
-            once = 0
-            multiple = 0
-            cell_for_digit = {} # digit -> col
-            for c in range(N):
-                if not self.grid.is_empty(r, c): continue
-                mask = self.layers.get_allowed_mask(r, c)
-                curr = mask
-                while curr:
-                    bit = curr & -curr
-                    d = bit.bit_length()
-                    if bit & once:
-                        multiple |= bit
-                    else:
-                        once |= bit
-                        cell_for_digit[d] = c
-                    curr &= ~bit
-            
-            singles = once & ~multiple
-            while singles:
-                bit = singles & -singles
-                d = bit.bit_length()
-                forced.append(ForcedMove(r, cell_for_digit[d], d))
-                singles &= ~bit
-
-        # Cols (Similar logic)
-        for c in range(N):
-            once = 0
-            multiple = 0
-            cell_for_digit = {} # digit -> row
-            for r in range(N):
-                if not self.grid.is_empty(r, c): continue
-                mask = self.layers.get_allowed_mask(r, c)
-                curr = mask
-                while curr:
-                    bit = curr & -curr
-                    d = bit.bit_length()
-                    if bit & once:
-                        multiple |= bit
-                    else:
-                        once |= bit
-                        cell_for_digit[d] = r
-                    curr &= ~bit
-            
-            singles = once & ~multiple
-            while singles:
-                bit = singles & -singles
-                d = bit.bit_length()
-                forced.append(ForcedMove(cell_for_digit[d], c, d))
-                singles &= ~bit
-
-        # Boxes
         box_size = self.grid.box_size
-        for b in range(N):
-            br = (b // box_size) * box_size
-            bc = (b % box_size) * box_size
-            once = 0
-            multiple = 0
-            cell_for_digit = {} # digit -> (r, c)
-            for dr in range(box_size):
-                for dc in range(box_size):
-                    r, c = br + dr, bc + dc
-                    if not self.grid.is_empty(r, c): continue
-                    mask = self.layers.get_allowed_mask(r, c)
-                    curr = mask
-                    while curr:
-                        bit = curr & -curr
-                        d = bit.bit_length()
-                        if bit & once:
-                            multiple |= bit
-                        else:
-                            once |= bit
-                            cell_for_digit[d] = (r, c)
-                        curr &= ~bit
-            
-            singles = once & ~multiple
+        bs_cols = N // box_size
+
+        # Naked singles + hidden singles data in a single N×N pass
+        row_once = [0] * N
+        row_multiple = [0] * N
+        row_cell = [{} for _ in range(N)]
+        col_once = [0] * N
+        col_multiple = [0] * N
+        col_cell = [{} for _ in range(N)]
+        box_once = [0] * N
+        box_multiple = [0] * N
+        box_cell = [{} for _ in range(N)]
+
+        all_masks = self.layers.get_all_allowed_masks().tolist()
+        for r in range(N):
+            for c in range(N):
+                mask = all_masks[r][c]
+                if not mask: continue
+                # Naked single check
+                if (mask & (mask - 1)) == 0:
+                    naked.append(ForcedMove(r, c, mask.bit_length()))
+                # Hidden singles accumulation
+                b = (r // box_size) * bs_cols + (c // box_size)
+                curr = mask
+                while curr:
+                    bit = curr & -curr
+                    d = bit.bit_length()
+                    if bit & row_once[r]:
+                        row_multiple[r] |= bit
+                    else:
+                        row_once[r] |= bit
+                        row_cell[r][d] = c
+                    if bit & col_once[c]:
+                        col_multiple[c] |= bit
+                    else:
+                        col_once[c] |= bit
+                        col_cell[c][d] = r
+                    if bit & box_once[b]:
+                        box_multiple[b] |= bit
+                    else:
+                        box_once[b] |= bit
+                        box_cell[b][d] = (r, c)
+                    curr &= ~bit
+
+        if naked: return self._deduplicate(naked)
+
+        # Extract hidden singles
+        forced: List[ForcedMove] = []
+        for i in range(N):
+            singles = row_once[i] & ~row_multiple[i]
             while singles:
                 bit = singles & -singles
                 d = bit.bit_length()
-                rr, cc = cell_for_digit[d]
+                forced.append(ForcedMove(i, row_cell[i][d], d))
+                singles &= ~bit
+
+            singles = col_once[i] & ~col_multiple[i]
+            while singles:
+                bit = singles & -singles
+                d = bit.bit_length()
+                forced.append(ForcedMove(col_cell[i][d], i, d))
+                singles &= ~bit
+
+            singles = box_once[i] & ~box_multiple[i]
+            while singles:
+                bit = singles & -singles
+                d = bit.bit_length()
+                rr, cc = box_cell[i][d]
                 forced.append(ForcedMove(rr, cc, d))
                 singles &= ~bit
 
@@ -503,55 +524,43 @@ class Propagator:
         for mv in moves:
             if self.grid.is_empty(mv.row, mv.col):
                 self.grid.set(mv.row, mv.col, mv.digit)
+                self.layers._update_masks(mv.row, mv.col, mv.digit, True)
                 self.visual.mark_forced(mv.row, mv.col, mv.digit)
-                self.dirty_cells.add((mv.row, mv.col))
-        # Don't rebuild here - let do_incremental_update handle it with Phase 1 optimization
 
     def check_for_contradictions(self) -> None:
         """
-        Optimized contradiction check using bitmasks.
+        Vectorized contradiction check using numpy.
         """
+        masks = self.layers.get_all_allowed_masks()
         N = self.grid.size
-        full_mask = (1 << N) - 1
+        full_mask = np.int64((1 << N) - 1)
+        empty = (self.grid.values == 0)
 
-        # Any empty cell with no allowed digits?
-        for r, c in self.grid.iter_cells():
-            if self.grid.is_empty(r, c):
-                if self.layers.get_allowed_mask(r, c) == 0:
-                    self.visual.mark_contradiction_cell(r, c)
-                    raise Contradiction(f"Cell ({r},{c}) has no allowed digits.")
+        # Zero-candidate check
+        zero = np.argwhere(empty & (masks == 0))
+        if len(zero):
+            r, c = int(zero[0, 0]), int(zero[0, 1])
+            self.visual.mark_contradiction_cell(r, c)
+            raise Contradiction(f"Cell ({r},{c}) has no allowed digits.")
 
-        # Any digit with no place in a unit?
-        # A digit d has no place in a unit if U_allowed_mask & (1 << (d-1)) is 0 
-        # for all empty cells, AND it's not already in the unit.
-        
-        for i in range(N):
-            # Rows
-            row_union = 0
-            for c in range(N):
-                if self.grid.is_empty(i, c):
-                    row_union |= self.layers.get_allowed_mask(i, c)
-            if (row_union | self.layers.row_masks[i]) != full_mask:
-                raise Contradiction(f"Row {i} is missing some digits.")
+        # Row unions
+        row_union = np.bitwise_or.reduce(masks, axis=1)
+        bad_rows = (row_union | self.layers.row_masks) != full_mask
+        if np.any(bad_rows):
+            raise Contradiction(f"Row {int(np.argmax(bad_rows))} is missing some digits.")
 
-            # Cols
-            col_union = 0
-            for r in range(N):
-                if self.grid.is_empty(r, i):
-                    col_union |= self.layers.get_allowed_mask(r, i)
-            if (col_union | self.layers.col_masks[i]) != full_mask:
-                raise Contradiction(f"Col {i} is missing some digits.")
+        # Col unions
+        col_union = np.bitwise_or.reduce(masks, axis=0)
+        bad_cols = (col_union | self.layers.col_masks) != full_mask
+        if np.any(bad_cols):
+            raise Contradiction(f"Col {int(np.argmax(bad_cols))} is missing some digits.")
 
-            # Boxes
-            box_union = 0
-            box_size = self.grid.box_size
-            br = (i // box_size) * box_size
-            bc = (i % box_size) * box_size
-            for dr in range(box_size):
-                for dc in range(box_size):
-                    if self.grid.is_empty(br+dr, bc+dc):
-                        box_union |= self.layers.get_allowed_mask(br+dr, bc+dc)
-            if (box_union | self.layers.box_masks[i]) != full_mask:
-                raise Contradiction(f"Box {i} is missing some digits.")
+        # Box unions via reshape
+        bs = self.grid.box_size
+        step1 = np.bitwise_or.reduce(masks.reshape(bs, bs, bs, bs), axis=3)
+        box_union = np.bitwise_or.reduce(step1, axis=1).ravel()
+        bad_boxes = (box_union | self.layers.box_masks) != full_mask
+        if np.any(bad_boxes):
+            raise Contradiction(f"Box {int(np.argmax(bad_boxes))} is missing some digits.")
 
     

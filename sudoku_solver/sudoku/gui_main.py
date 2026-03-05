@@ -42,6 +42,14 @@ def main():
         "solve_btn": None
     }
 
+    def highlight_active_button():
+        sizes = [9, 16, 25, 36, 49]
+        for btn, s in zip(ui_refs["size_buttons"], sizes):
+            if s == state["size"]:
+                btn.config(bg="#4CAF50", fg="white")
+            else:
+                btn.config(bg="#3d3d3d", fg="white")
+
     def load_preset(size, density=None):
         if state["solving"]:
             return  # Don't allow loading while solving
@@ -63,6 +71,7 @@ def main():
         elif size == 49:
             state["puzzle"] = example_puzzle_n49(density)
         
+        highlight_active_button()
         if ui_refs["status_label"]:
             ui_refs["status_label"].config(text="READY", fg="#888888")
         setup_board()
@@ -86,6 +95,48 @@ def main():
         
         # Re-enable all buttons
         set_buttons_enabled(True)
+
+    # Size buttons
+    for s in [9, 16, 25, 36, 49]:
+        btn = tk.Button(header, text=f"{s}x{s}", command=lambda size=s: load_preset(size),
+                        bg="#3d3d3d", fg="white", relief="flat", padx=10)
+        btn.pack(side="left", padx=5)
+        ui_refs["size_buttons"].append(btn)
+
+    # Density Slider
+    tk.Label(header, text="Density:", fg="white", bg="#2d2d2d", font=("Arial", 10)).pack(side="left", padx=(20, 5))
+    density_slider = tk.Scale(header, from_=10, to=90, orient="horizontal", bg="#2d2d2d", fg="white", 
+                              highlightthickness=0, length=150, relief="flat")
+    density_slider.set(60)
+    density_slider.pack(side="left", padx=5)
+    ui_refs["density_slider"] = density_slider
+
+    # New Grid button
+    new_btn = tk.Button(header, text="[ NEW GRID ]", command=lambda: load_preset(state["size"]),
+                        bg="#1a1a1a", fg="#00ff00", relief="flat", font=("Arial", 10, "bold"), padx=10)
+    new_btn.pack(side="left", padx=10)
+    ui_refs["new_grid_btn"] = new_btn
+
+    # Stop button - stops solver and reloads current puzzle
+    stop_btn = tk.Button(header, text="[ STOP ]", command=stop_solver,
+                         bg="#1a1a1a", fg="#FF6B6B", relief="flat", font=("Arial", 10, "bold"), padx=10)
+    stop_btn.pack(side="left", padx=5)
+    ui_refs["stop_btn"] = stop_btn
+
+    # Solve button (in header, beside other controls)
+    solve_btn = tk.Button(header, text="SOLVE PUZZLE", command=lambda: None,
+                          bg="#4CAF50", fg="white", font=("Arial", 10, "bold"),
+                          relief="flat", padx=10)
+    solve_btn.pack(side="left", padx=10)
+    ui_refs["solve_btn"] = solve_btn
+
+    # Status label (in header)
+    status_label = tk.Label(header, text="READY", fg="#888888", bg="#2d2d2d", font=("Arial", 12, "bold"))
+    status_label.pack(side="left", padx=10)
+    ui_refs["status_label"] = status_label
+
+    board_container = tk.Frame(root, bg="#1e1e1e", padx=20, pady=20)
+    board_container.pack()
 
     def set_buttons_enabled(enabled: bool):
         """Enable or disable all control buttons (except STOP which is always enabled)"""
@@ -184,57 +235,19 @@ def main():
         state["solver_thread"] = threading.Thread(target=run_solver_thread, daemon=True)
         state["solver_thread"].start()
 
-    # Size buttons
-    for s in [9, 16, 25, 36, 49]:
-        btn = tk.Button(header, text=f"{s}x{s}", command=lambda size=s: load_preset(size),
-                        bg="#3d3d3d", fg="white", relief="flat", padx=10)
-        btn.pack(side="left", padx=5)
-        ui_refs["size_buttons"].append(btn)
-
-    # Density Slider
-    tk.Label(header, text="Density:", fg="white", bg="#2d2d2d", font=("Arial", 10)).pack(side="left", padx=(20, 5))
-    density_slider = tk.Scale(header, from_=10, to=90, orient="horizontal", bg="#2d2d2d", fg="white", 
-                              highlightthickness=0, length=150, relief="flat")
-    density_slider.set(50)
-    density_slider.pack(side="left", padx=5)
-    ui_refs["density_slider"] = density_slider
-
-    # New Grid button
-    new_btn = tk.Button(header, text="[ NEW GRID ]", command=lambda: load_preset(state["size"]),
-                        bg="#1a1a1a", fg="#00ff00", relief="flat", font=("Arial", 10, "bold"), padx=10)
-    new_btn.pack(side="left", padx=10)
-    ui_refs["new_grid_btn"] = new_btn
-
-    # Stop button - stops solver and reloads current puzzle
-    stop_btn = tk.Button(header, text="[ STOP ]", command=stop_solver,
-                         bg="#1a1a1a", fg="#FF6B6B", relief="flat", font=("Arial", 10, "bold"), padx=10)
-    stop_btn.pack(side="left", padx=5)
-    ui_refs["stop_btn"] = stop_btn
-
-    # Status Label
-    status_label = tk.Label(header, text="READY", fg="#888888", bg="#2d2d2d", font=("Arial", 11, "bold"))
-    status_label.pack(side="left", padx=20)
-    ui_refs["status_label"] = status_label
-
-    # Solve button
-    solve_btn = tk.Button(header, text="[ SOLVE PUZZLE ]", command=run_solver,
-                          bg="#4CAF50", fg="white", font=("Arial", 10, "bold"), 
-                          relief="flat", padx=15, pady=2)
-    solve_btn.pack(side="left", padx=10)
-    ui_refs["solve_btn"] = solve_btn
-
-    board_container = tk.Frame(root, bg="#1e1e1e", padx=20, pady=20)
-    board_container.pack()
-
     def on_closing():
         """Handle window close event"""
         state["window_open"] = False
         root.destroy()
 
+    # Wire up solve button command now that run_solver is defined
+    solve_btn.config(command=run_solver)
+
     # Set window close handler
     root.protocol("WM_DELETE_WINDOW", on_closing)
 
     setup_board()
+    highlight_active_button()
     root.mainloop()
 
 

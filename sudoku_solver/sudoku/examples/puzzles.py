@@ -1,5 +1,5 @@
 import random
-
+random.seed(32678)  # For reproducibility of generated puzzles
 def _generate_dynamic_puzzle(size: int, box: int, density: float = 0.5):
     """
     Generates a varied, valid Sudoku puzzle of any size.

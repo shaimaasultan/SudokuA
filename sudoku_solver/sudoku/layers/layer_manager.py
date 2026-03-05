@@ -1,5 +1,6 @@
 # sudoku/layers/layer_manager.py
 
+import numpy as np
 from typing import List, Tuple
 from ..model.grid import Grid
 
@@ -17,12 +18,19 @@ class LayerManager:
         self.digits = list(range(1, self.size + 1))
         
         # Bitmasks for digits used in each unit
-        self.row_masks = [0] * self.size
-        self.col_masks = [0] * self.size
-        self.box_masks = [0] * self.size
+        self.row_masks = np.zeros(self.size, dtype=np.int64)
+        self.col_masks = np.zeros(self.size, dtype=np.int64)
+        self.box_masks = np.zeros(self.size, dtype=np.int64)
         
         # Manual forbids per cell
-        self.manual_masks = [[0] * self.size for _ in range(self.size)]
+        self.manual_masks = np.zeros((self.size, self.size), dtype=np.int64)
+        
+        # Precomputed box index array for vectorized operations
+        N = self.size
+        bs = grid.box_size
+        rs = np.arange(N, dtype=np.intp).reshape(N, 1)
+        cs = np.arange(N, dtype=np.intp).reshape(1, N)
+        self._box_idx = (rs // bs) * (N // bs) + (cs // bs)
         
         if not skip_rebuild:
             self.rebuild_all_layers()
@@ -30,10 +38,10 @@ class LayerManager:
     def clone(self, grid: Grid = None) -> "LayerManager":
         new_grid = grid if grid is not None else self.grid.clone()
         clone = LayerManager(new_grid, skip_rebuild=True)
-        clone.row_masks = self.row_masks[:]
-        clone.col_masks = self.col_masks[:]
-        clone.box_masks = self.box_masks[:]
-        clone.manual_masks = [row[:] for row in self.manual_masks]
+        clone.row_masks = self.row_masks.copy()
+        clone.col_masks = self.col_masks.copy()
+        clone.box_masks = self.box_masks.copy()
+        clone.manual_masks = self.manual_masks.copy()
         return clone
 
     def get_cell_degree(self, r: int, c: int) -> int:
@@ -62,66 +70,39 @@ class LayerManager:
         return count
 
     def rebuild_all_layers(self) -> None:
-        self.row_masks = [0] * self.size
-        self.col_masks = [0] * self.size
-        self.box_masks = [0] * self.size
+        self.row_masks.fill(0)
+        self.col_masks.fill(0)
+        self.box_masks.fill(0)
+        self.manual_masks.fill(0)
 
-        for r, c in self.grid.iter_cells():
-            v = self.grid.get(r, c)
-            if v != 0:
-                self._update_masks(r, c, v, True)
-
-    def rebuild_affected_units(self, dirty_cells: set) -> None:
-        """
-        Incrementally rebuild only the affected units for dirty cells.
-        Much faster than rebuild_all_layers() when only a few cells changed.
-        dirty_cells: set of (r, c) tuples that affected the grid
-        """
-        if not dirty_cells:
-            return
+        # Vectorized: get all non-zero positions
+        non_zero_indices = np.nonzero(self.grid.values)
+        rs, cs = non_zero_indices
+        vs = self.grid.values[rs, cs]
         
-        # Collect all affected units
-        affected_rows = set()
-        affected_cols = set()
-        affected_boxes = set()
+        # Compute bits and box indices
+        bits = 1 << (vs - 1)
         box_size = self.grid.box_size
+        bs = box_size * (rs // box_size) + (cs // box_size)
         
-        for r, c in dirty_cells:
-            affected_rows.add(r)
-            affected_cols.add(c)
-            affected_boxes.add(box_size * (r // box_size) + (c // box_size))
-        
-        # Reset only affected mask rows
-        for r in affected_rows:
-            self.row_masks[r] = 0
-        # Reset only affected mask cols
-        for c in affected_cols:
-            self.col_masks[c] = 0
-        # Reset only affected mask boxes
-        for b in affected_boxes:
-            self.box_masks[b] = 0
-        
-        # Rebuild only affected units by scanning grid
-        for r, c in self.grid.iter_cells():
-            v = self.grid.get(r, c)
-            if v == 0:
-                continue
-            
-            # Check if this cell affects any of our affected units
-            box_idx = box_size * (r // box_size) + (c // box_size)
-            if r in affected_rows or c in affected_cols or box_idx in affected_boxes:
-                self._update_masks(r, c, v, True)
+        # Batch update masks
+        for i in range(len(rs)):
+            r, c, bit, b = rs[i], cs[i], bits[i], bs[i]
+            self.row_masks[r] |= bit
+            self.col_masks[c] |= bit
+            self.box_masks[b] |= bit
 
     def _update_masks(self, r: int, c: int, v: int, set_bits: bool) -> None:
         bit = 1 << (v - 1)
+        b = self.grid.box_size * (r // self.grid.box_size) + (c // self.grid.box_size)
         if set_bits:
             self.row_masks[r] |= bit
             self.col_masks[c] |= bit
-            self.box_masks[self.grid.box_size * (r // self.grid.box_size) + (c // self.grid.box_size)] |= bit
+            self.box_masks[b] |= bit
         else:
             self.row_masks[r] &= ~bit
             self.col_masks[c] &= ~bit
-            self.box_masks[self.grid.box_size * (r // self.grid.box_size) + (c // self.grid.box_size)] &= ~bit
+            self.box_masks[b] &= ~bit
 
     def is_forbidden(self, d: int, r: int, c: int) -> bool:
         """Combined forbidden check: Row | Col | Box | Manual | GridSet"""
@@ -160,7 +141,17 @@ class LayerManager:
                                self.box_masks[b] | 
                                self.manual_masks[r][c])
         full_mask = (1 << self.size) - 1
-        return full_mask & ~combined_forbidden
+        return int(full_mask & ~combined_forbidden)
+
+    def get_all_allowed_masks(self):
+        """Vectorized N×N allowed mask computation. Returns numpy int64 array."""
+        N = self.size
+        full_mask = np.int64((1 << N) - 1)
+        combined = (self.row_masks[:, np.newaxis]
+                  | self.col_masks[np.newaxis, :]
+                  | self.box_masks[self._box_idx]
+                  | self.manual_masks)
+        return np.where(self.grid.values == 0, full_mask & ~combined, np.int64(0))
 
     def count_candidates_for_digit(self, d: int) -> int:
         count = 0

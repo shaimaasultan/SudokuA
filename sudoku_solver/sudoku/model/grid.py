@@ -1,5 +1,6 @@
 # sudoku/model/grid.py
 
+import numpy as np
 from typing import List, Optional
 
 
@@ -16,23 +17,25 @@ class Grid:
             raise ValueError("Grid size must be a perfect square (e.g., 9, 16, 25).")
 
         if values is None:
-            self.values = [[0 for _ in range(size)] for _ in range(size)]
+            self.values = np.zeros((size, size), dtype=int)
         else:
             if len(values) != size or any(len(row) != size for row in values):
                 raise ValueError("Values must be an N x N matrix.")
-            self.values = [row[:] for row in values]
+            self.values = np.array(values, dtype=int)
 
     def clone(self) -> "Grid":
-        return Grid(self.size, self.values)
+        new_grid = Grid(self.size)
+        new_grid.values = self.values.copy()
+        return new_grid
 
     def get(self, r: int, c: int) -> int:
-        return self.values[r][c]
+        return int(self.values[r, c])
 
     def set(self, r: int, c: int, v: int) -> None:
-        self.values[r][c] = v
+        self.values[r, c] = v
 
     def is_empty(self, r: int, c: int) -> bool:
-        return self.values[r][c] == 0
+        return self.values[r, c] == 0
 
     def iter_cells(self):
         for r in range(self.size):
